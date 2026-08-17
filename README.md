@@ -3,8 +3,9 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/NavyashreeNS/halcyon/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/NavyashreeNS/halcyon/ci.yml?branch=main&style=flat-square&label=CI"></a>
   <a href="#quickstart"><img alt="quickstart" src="https://img.shields.io/badge/quickstart-60_seconds-4c9aff?style=flat-square"></a>
-  <a href="#the-numbers"><img alt="tests" src="https://img.shields.io/badge/tests-157_passing-3fb950?style=flat-square"></a>
+  <a href="#the-numbers"><img alt="tests" src="https://img.shields.io/badge/tests-159_passing-3fb950?style=flat-square"></a>
   <img alt="typescript" src="https://img.shields.io/badge/TypeScript-strict-3178c6?style=flat-square">
   <img alt="node" src="https://img.shields.io/badge/Node-%E2%89%A520.11-339933?style=flat-square">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-Apache_2.0-8b98a9?style=flat-square"></a>
@@ -104,6 +105,27 @@ $ node scripts/verify-rollout.mjs
 ```
 
 Both run in CI on every push, against a real fleet — not as illustrations.
+
+### And it catches a regression nobody wrote a test for
+
+Running the same fleet under sustained load (18,036 requests, 0 errors, 0 shed) with a canary
+ramping behind it produced this decision trail, unprompted:
+
+```
+  25% -> hold      insufficient_data      | baseline 5398 req p95 159ms | canary   16 req p95  85ms
+  25% -> hold      awaiting_confirmation  | baseline 1647 req p95 142ms | canary  488 req p95  68ms
+  25% -> advance                          | baseline 1595 req p95 148ms | canary  500 req p95  63ms
+  60% -> hold      awaiting_confirmation  | baseline  462 req p95  86ms | canary 1756 req p95 108ms
+  60% -> rollback  latency                | baseline  440 req p95  77ms | canary 1680 req p95 121ms
+```
+
+At 25% the canary looked **twice as fast** as the baseline — it runs on the faster
+accelerator. At 60% it regressed and was rolled back, because _one_ canary replica was
+carrying 60% of traffic while _two_ baseline replicas shared the remaining 40%. The canary
+was never slower; it was under-provisioned, and that only becomes visible under load.
+
+A rollout validated at 1% and then promoted would have shipped it. This is the entire
+argument for ramping progressively and judging against a concurrent baseline.
 
 ---
 
@@ -354,7 +376,7 @@ same code runs unchanged inside the gateway, inside a worker, or inside the simu
 - **Deterministic tests.** Injectable clocks and seeded PRNGs. No `sleep()`, no flakes.
 - **Reproducible benchmarks.** The simulation is fully seeded, so a change in the output is a
   change in behaviour rather than machine noise. CI posts it to the job summary.
-- **CI that can actually fail** — format, typecheck, 157 tests, the benchmark, a real
+- **CI that can actually fail** — format, typecheck, 159 tests, the benchmark, a real
   end-to-end load test against a booted fleet, an automated canary rollout verification, and a
   three-service Docker build matrix.
 - **Metrics with bounded cardinality.** Every label has a small domain. Histogram _buckets_ are
@@ -378,28 +400,41 @@ caused.
 | [0004](docs/adr/0004-sticky-canary-rollouts.md)  | Sticky canary rollouts     | Why `Math.random() < weight` is a correctness bug, not a style choice                                                                                                                          |
 | [0005](docs/adr/0005-state-placement.md)         | In-memory scheduling state | Instances disagreeing is the design, not a compromise — P2C _requires_ it                                                                                                                      |
 
-### Four bugs worth reading about
+### Five bugs worth reading about
 
 Each was found by running the system rather than by reading it, and each is now pinned by a
 regression test.
 
-0. **A queue requests could disappear into.** With every replica draining there was nowhere to
+1. **Backpressure scored as failure — which crashed the gateway.** A worker executing a batch
+   answers 503 immediately, and the gateway counted that against the replica's circuit
+   breaker. So a replica was shunned for being _fully utilised_, which pushed its load onto
+   the next replica, which was then shunned too. Under sustained load the fleet ate itself:
+   `No available replica`, an error storm, and a hard process exit. Backpressure and faults
+   are different signals — a busy replica is now retried elsewhere and its breaker untouched.
+   The same run went from a crash to **18,036 requests, 0 errors, 0 shed**.
+
+   Its neighbour: hedging now stands down near saturation. A hedge spends spare capacity to
+   buy tail latency, and when there is none to spend it occupies the very replica the next
+   batch needed — turning a latency optimisation into a throughput regression exactly when
+   the fleet can least afford one.
+
+2. **A queue requests could disappear into.** With every replica draining there was nowhere to
    dispatch, so the batcher held its contents — forever. The caller's connection stayed open
    long past any useful answer. A scheduler that reasons about deadlines must also _enforce_
    them on its own queue: queued work is now evicted the moment its deadline passes, and the
    client gets an explicit `deadline_unreachable` instead of a hang.
 
-1. **A busy-spin at saturation.** As load approaches capacity, deadline slack converges to zero
+3. **A busy-spin at saturation.** As load approaches capacity, deadline slack converges to zero
    _from above_. The scheduler armed a timer 0.4ms out, woke, recomputed an equally tiny slack,
    and re-armed — burning the event loop precisely when it was scarcest. No runtime honours a
    sub-millisecond timer anyway, so slack below one tick is slack that cannot be spent.
 
-2. **`Promise.race` in the hedge path.** Race settles on the first promise to settle —
+4. **`Promise.race` in the hedge path.** Race settles on the first promise to settle —
    _including one that rejects_. A hedge failing fast against a busy replica killed batches
    whose primary was running perfectly. Exactly the failure hedging exists to prevent. The
    semantics needed are `Promise.any`: succeed if any attempt succeeds, fail only if all do.
 
-3. **Scoring is not exclusion.** Peak-EWMA makes a busy replica _less attractive_, but a worker
+5. **Scoring is not exclusion.** Peak-EWMA makes a busy replica _less attractive_, but a worker
    that accepts one batch at a time needs it to be _ineligible_ — a slow-enough replica could
    still win the comparison while already occupied. 2.7% of requests failed on arrival until
    the router gained a hard per-replica concurrency ceiling.

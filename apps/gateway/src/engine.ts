@@ -50,6 +50,20 @@ export class EngineError extends Error {
   }
 }
 
+/**
+ * A replica-level dispatch failure. `busy` distinguishes backpressure — the replica is
+ * healthy but fully occupied — from a genuine fault, so the two can be scored differently.
+ */
+class ReplicaError extends Error {
+  constructor(
+    message: string,
+    readonly busy: boolean,
+  ) {
+    super(message);
+    this.name = 'ReplicaError';
+  }
+}
+
 /** Rolling per-version counters, reset each analysis window, that drive canary decisions. */
 interface VersionWindow {
   requests: number;
@@ -58,6 +72,23 @@ interface VersionWindow {
 }
 
 const modelKey = (modelId: string, version: string): string => `${modelId}@${version}`;
+
+/** How many times a batch may be re-offered to the fleet when replicas report backpressure. */
+const BUSY_RETRY_ATTEMPTS = 3;
+
+/**
+ * Whether a dispatch failed only because the fleet was busy. `Promise.any` reports every
+ * attempt's failure as an AggregateError, so a hedged dispatch is busy-caused only when
+ * *all* of its attempts were.
+ */
+function isBusyFailure(error: unknown): boolean {
+  if (error instanceof ReplicaError) return error.busy;
+  if (error instanceof EngineError) return error.code === 'no_capacity';
+  if (error instanceof AggregateError) {
+    return error.errors.length > 0 && error.errors.every(isBusyFailure);
+  }
+  return false;
+}
 
 /**
  * The request path.
@@ -348,9 +379,7 @@ export class InferenceEngine {
   }
 
   private hasDispatchCapacity(key: string, modelId: string, version: string): boolean {
-    const replicaCount = this.router
-      .snapshot()
-      .filter((r) => r.modelId === modelId && r.version === version && !r.draining).length;
+    const replicaCount = this.router.availableCount(modelId, version);
     if (replicaCount === 0) return false;
     const inFlight = this.inFlightBatches.get(key)?.count ?? 0;
     return inFlight < replicaCount * this.config.maxInFlightBatchesPerReplica;
@@ -401,11 +430,11 @@ export class InferenceEngine {
     }
 
     try {
-      const { response, replicaId, hedged } = await this.executeWithHedge(
-        modelId,
-        version,
-        batchId,
-        batch,
+      // A replica answering "busy" is reporting backpressure, not a fault, and the right
+      // response is to try a different one rather than fail every request in the batch.
+      // Bounded, so a uniformly saturated fleet fails fast instead of walking every replica.
+      const { response, replicaId, hedged } = await this.withBusyRetry(BUSY_RETRY_ATTEMPTS, () =>
+        this.executeWithHedge(modelId, version, batchId, batch, key),
       );
       const executionMs = Date.now() - dispatchedAt;
       batcher?.recordExecution(batch.totalTokens, executionMs);
@@ -480,6 +509,7 @@ export class InferenceEngine {
     version: string,
     batchId: string,
     batch: BatchFlush<PendingRequest>,
+    key: string,
   ): Promise<{ response: BatchExecutionResponse; replicaId: string; hedged: boolean }> {
     const primary = this.router.pick(modelId, version);
     if (!primary.ok) {
@@ -495,9 +525,17 @@ export class InferenceEngine {
       })),
     };
 
-    const hedgeDelay = this.config.hedgingEnabled
-      ? this.router.hedgeDelayMs(modelId, version, this.config.hedgeMinimumSamples)
-      : null;
+    // Hedging spends spare capacity to buy tail latency. Near saturation there is no spare
+    // capacity to spend, and a hedge occupies the very replica the *next* batch needed —
+    // converting a latency optimisation into a throughput regression exactly when the fleet
+    // can least afford one. So it stands down unless a replica would still be free after
+    // both the primary dispatch and the hedge.
+    const spareCapacity =
+      this.router.availableCount(modelId, version) - (this.inFlightBatches.get(key)?.count ?? 0);
+    const hedgeDelay =
+      this.config.hedgingEnabled && spareCapacity > 1
+        ? this.router.hedgeDelayMs(modelId, version, this.config.hedgeMinimumSamples)
+        : null;
 
     type Attempt = { response: BatchExecutionResponse; replicaId: string; hedged: boolean };
 
@@ -553,13 +591,35 @@ export class InferenceEngine {
       primaryAbort.abort();
       hedgeAbort.abort();
       if (error instanceof AggregateError) {
+        // Re-raise as a single error, but preserve whether every attempt failed purely on
+        // backpressure — that is what tells the caller a retry is worth making.
         const first = error.errors.find((e): e is Error => e instanceof Error);
-        throw new EngineError('upstream_failure', first?.message ?? 'All replicas failed');
+        throw new ReplicaError(first?.message ?? 'All replicas failed', isBusyFailure(error));
       }
       throw error;
     } finally {
       if (hedgeTimer) clearTimeout(hedgeTimer);
     }
+  }
+
+  /**
+   * Retries `attempt` while it fails purely because replicas were busy.
+   *
+   * The router's power-of-two-choices sampling is what makes this worth doing: a retry
+   * draws a fresh pair of candidates rather than deterministically re-picking the replica
+   * that just refused, so each attempt has a genuinely different chance of landing.
+   */
+  private async withBusyRetry<R>(attempts: number, attempt: () => Promise<R>): Promise<R> {
+    let lastError: unknown;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        return await attempt();
+      } catch (error) {
+        lastError = error;
+        if (!isBusyFailure(error)) throw error;
+      }
+    }
+    throw lastError;
   }
 
   private async callReplica(
@@ -577,17 +637,25 @@ export class InferenceEngine {
         signal: AbortSignal.any([signal, AbortSignal.timeout(this.config.upstreamTimeoutMs)]),
       });
       if (!response.ok) {
-        throw new Error(`Replica ${replica.id} returned HTTP ${response.status}`);
+        // 503 means "busy right now", not "broken". A replica already executing a batch
+        // answers instantly with it, and counting that against the circuit breaker would
+        // shun a perfectly healthy replica for the crime of being fully utilised — then
+        // shun the next one, until the fleet has no capacity at all. Backpressure and
+        // failure are different signals and must be scored differently.
+        throw new ReplicaError(
+          `Replica ${replica.id} returned HTTP ${response.status}`,
+          response.status === 503,
+        );
       }
       const body = (await response.json()) as BatchExecutionResponse;
       this.router.dispatchCompleted(replica.id, Date.now() - startedAt, true);
       return body;
     } catch (error) {
-      // An abort is a deliberate cancellation of a hedge loser, not evidence that the
-      // replica is unhealthy — scoring it as a failure would trip the breaker on a replica
-      // that did nothing wrong.
+      // Neither an abort (a deliberately cancelled hedge loser) nor a busy signal is
+      // evidence of ill health, so neither counts against the replica.
       const aborted = error instanceof Error && error.name === 'AbortError';
-      this.router.dispatchCompleted(replica.id, Date.now() - startedAt, aborted);
+      const busy = error instanceof ReplicaError && error.busy;
+      this.router.dispatchCompleted(replica.id, Date.now() - startedAt, aborted || busy);
       throw error;
     }
   }

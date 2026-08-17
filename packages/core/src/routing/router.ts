@@ -274,6 +274,30 @@ export class Router {
     return this.replicas.size;
   }
 
+  /**
+   * Number of replicas currently able to accept work for a model version.
+   *
+   * Exists because the scheduler asks this question on every batching decision, and the
+   * obvious implementation — filtering `snapshot()` — allocates an array and sorts the
+   * fleet's latencies to compute scores nobody reads. That is a surprising amount of work
+   * to put on the hot path in order to answer "how many are up?".
+   */
+  availableCount(modelId: string, version: string): number {
+    const ids = this.byModel.get(modelKey(modelId, version));
+    if (!ids) return 0;
+    const now = this.clock.now();
+    let count = 0;
+    for (const id of ids) {
+      const state = this.replicas.get(id);
+      if (!state) continue;
+      if (state.draining) continue;
+      if (now - state.lastSeen > this.heartbeatTimeoutMs) continue;
+      if (state.breaker.peek(now) === BreakerState.Open) continue;
+      count += 1;
+    }
+    return count;
+  }
+
   snapshot(): ReplicaSnapshot[] {
     const now = this.clock.now();
     return [...this.replicas.values()].map((state) => ({

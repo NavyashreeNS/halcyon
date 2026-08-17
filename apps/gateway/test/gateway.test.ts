@@ -24,6 +24,8 @@ interface FakeWorker {
   address: string;
   /** Set to fail every execution, for breaker and error-path tests. */
   failing: boolean;
+  /** Reject the next `busyFor` batches with 503 — backpressure, not a fault. */
+  busyFor: number;
   /** Artificial delay per batch, for latency-sensitive tests. */
   delayMs: number;
   batches: { batchId: string; size: number }[];
@@ -34,6 +36,7 @@ async function startFakeWorker(replicaId: string): Promise<FakeWorker> {
     app: Fastify({ logger: false }),
     address: '',
     failing: false,
+    busyFor: 0,
     delayMs: 0,
     batches: [],
   };
@@ -43,6 +46,11 @@ async function startFakeWorker(replicaId: string): Promise<FakeWorker> {
     async (request, reply) => {
       const { batchId, items } = request.body;
       state.batches.push({ batchId, size: items.length });
+      if (state.busyFor > 0) {
+        state.busyFor -= 1;
+        reply.code(503);
+        return { error: 'replica busy' };
+      }
       if (state.delayMs > 0) {
         await new Promise((resolve) => setTimeout(resolve, state.delayMs));
       }
@@ -252,6 +260,30 @@ describe('gateway', () => {
       const response = await infer(harness, { deadlineMs: 10, maxOutputTokens: 4_096 });
       expect(response.statusCode).toBe(503);
       expect(response.json().error.code).toBe('deadline_unreachable');
+    });
+
+    it('retries a busy replica rather than failing the batch', async () => {
+      // A 503 means "fully occupied", not "broken". Failing the batch on backpressure was
+      // observed shedding real traffic under sustained load.
+      const worker = await registerWorker(harness, 'replica-a');
+      worker.busyFor = 1;
+      const response = await infer(harness);
+      expect(response.statusCode).toBe(200);
+      expect(worker.batches.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it('does not hold a busy signal against a replica', async () => {
+      // Counting backpressure as failure trips the breaker on a healthy replica, then on
+      // the next one, until the fleet has no capacity at all. This was the cause of a live
+      // crash: a 503 cascade starved routing until every dispatch errored.
+      const worker = await registerWorker(harness, 'replica-a');
+      worker.busyFor = 2;
+      await infer(harness);
+
+      const state = await harness.app.inject({ method: 'GET', url: '/v1/control/state' });
+      const replica = state.json().replicas[0];
+      expect(replica.breaker.state).toBe('closed');
+      expect(replica.totalFailed).toBe(0);
     });
 
     it('reports upstream failure without hanging the client', async () => {
