@@ -1,0 +1,135 @@
+# A complete Halcyon fleet on one machine.
+#
+# The three workers are deliberately heterogeneous — a fast replica, a 0.6x straggler, and
+# one on a different model version. A homogeneous fleet makes any load balancer look
+# competent; imbalance is the only condition under which routing decisions are observable.
+#
+#   docker compose -f infra/docker/docker-compose.yml up -d --build
+#
+name: halcyon
+
+x-worker-base: &worker-base
+  build:
+    context: ../..
+    dockerfile: infra/docker/Dockerfile.worker
+  restart: unless-stopped
+  depends_on:
+    gateway:
+      condition: service_healthy
+  networks: [halcyon]
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: halcyon
+      POSTGRES_PASSWORD: halcyon
+      POSTGRES_DB: halcyon
+    ports: ['5432:5432']
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U halcyon -d halcyon']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [halcyon]
+
+  gateway:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.gateway
+    ports: ['8080:8080']
+    environment:
+      NODE_ENV: production
+      PORT: '8080'
+      LOG_LEVEL: info
+      DATABASE_URL: postgres://halcyon:halcyon@postgres:5432/halcyon
+      MAX_BATCH_SIZE: '32'
+      LINGER_MS: '20'
+      SAFETY_MARGIN_MS: '15'
+      CANARY_ANALYSIS_INTERVAL_MS: '15000'
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318/v1/traces
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [halcyon]
+
+  worker-a:
+    <<: *worker-base
+    environment:
+      PORT: '9100'
+      REPLICA_ID: replica-a
+      MODEL_ID: llama-3-8b
+      MODEL_VERSION: v1
+      ADVERTISE_ADDRESS: http://worker-a:9100
+      GATEWAY_URL: http://gateway:8080
+      ACCELERATOR: a10g
+
+  worker-b:
+    <<: *worker-base
+    environment:
+      PORT: '9100'
+      REPLICA_ID: replica-b
+      MODEL_ID: llama-3-8b
+      MODEL_VERSION: v1
+      ADVERTISE_ADDRESS: http://worker-b:9100
+      GATEWAY_URL: http://gateway:8080
+      ACCELERATOR: a10g
+      # A deliberate straggler, so peak-EWMA routing has an imbalance to correct.
+      SPEED_FACTOR: '0.6'
+
+  worker-canary:
+    <<: *worker-base
+    environment:
+      PORT: '9100'
+      REPLICA_ID: replica-c
+      MODEL_ID: llama-3-8b
+      MODEL_VERSION: v2
+      ADVERTISE_ADDRESS: http://worker-canary:9100
+      GATEWAY_URL: http://gateway:8080
+      ACCELERATOR: h100
+      SPEED_FACTOR: '1.4'
+      REPLICA_WEIGHT: '2'
+
+  web:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.web
+      args:
+        # The browser calls the gateway directly, so this must be the address as seen from
+        # the user's machine — not the compose-internal hostname.
+        GATEWAY_URL: http://localhost:8080
+    ports: ['3000:3000']
+    depends_on: [gateway]
+    restart: unless-stopped
+    networks: [halcyon]
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    ports: ['9090:9090']
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=6h'
+    depends_on: [gateway]
+    networks: [halcyon]
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.117.0
+    command: ['--config=/etc/otel/config.yaml']
+    volumes:
+      - ./otel-collector.yaml:/etc/otel/config.yaml:ro
+    ports:
+      - '4318:4318' # OTLP/HTTP
+    networks: [halcyon]
+
+volumes:
+  postgres-data:
+
+networks:
+  halcyon:
+    driver: bridge

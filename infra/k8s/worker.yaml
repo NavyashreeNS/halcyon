@@ -1,0 +1,90 @@
+# Model workers.
+#
+# A StatefulSet rather than a Deployment, for one reason: stable network identity. Each
+# worker advertises an address the gateway dials directly, and a Deployment's random pod
+# names would mean re-registering under a new identity on every restart, orphaning the
+# router's accumulated latency history for that replica each time.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: worker-v1
+  namespace: halcyon
+  labels: { app: worker, model: llama-3-8b, version: v1 }
+spec:
+  serviceName: worker-v1
+  replicas: 4
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: { app: worker, version: v1 }
+  template:
+    metadata:
+      labels: { app: worker, model: llama-3-8b, version: v1 }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        seccompProfile: { type: RuntimeDefault }
+      # In a real deployment this selects GPU nodes and the container requests
+      # `nvidia.com/gpu`. The simulated runtime needs only CPU, so the fleet can be
+      # exercised end to end without an accelerator.
+      nodeSelector:
+        kubernetes.io/os: linux
+      containers:
+        - name: worker
+          image: ghcr.io/navyashreens/halcyon-worker:latest
+          ports:
+            - { name: http, containerPort: 9100 }
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: REPLICA_ID
+              value: $(POD_NAME)
+            - name: ADVERTISE_ADDRESS
+              value: http://$(POD_NAME).worker-v1.halcyon.svc.cluster.local:9100
+            - name: GATEWAY_URL
+              value: http://gateway.halcyon.svc.cluster.local
+            - name: MODEL_ID
+              value: llama-3-8b
+            - name: MODEL_VERSION
+              value: v1
+            - name: ACCELERATOR
+              value: a10g
+            - name: PORT
+              value: '9100'
+          resources:
+            requests: { cpu: '2000m', memory: '2Gi' }
+            limits: { cpu: '2000m', memory: '4Gi' }
+            # limits:
+            #   nvidia.com/gpu: 1
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ['ALL'] }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          lifecycle:
+            preStop:
+              # The worker's SIGTERM handler asks the gateway to drain it before closing the
+              # listener, so in-flight batches finish rather than being severed. The pause
+              # gives that round trip time to land.
+              exec: { command: ['sleep', '15'] }
+      # Loading model weights is slow; a grace period shorter than a batch's execution time
+      # would guarantee dropped work on every rolling update.
+      terminationGracePeriodSeconds: 120
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker-v1
+  namespace: halcyon
+spec:
+  clusterIP: None # Headless: gives every pod its own stable DNS record.
+  selector: { app: worker, version: v1 }
+  ports:
+    - { name: http, port: 9100, targetPort: http }

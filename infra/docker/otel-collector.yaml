@@ -1,0 +1,30 @@
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Bound the collector's memory before the batcher's queue can grow without limit. A
+  # collector that OOMs takes observability down exactly when it is most needed.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 15
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  # Local development prints traces to the collector's log. Swap this for otlp/jaeger,
+  # otlp/tempo or a vendor exporter without touching a line of application code — which is
+  # the entire point of exporting OTLP rather than a proprietary format.
+  debug:
+    verbosity: normal
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug]

@@ -1,0 +1,16 @@
+global:
+  # Matched to the gateway's own gauge-publication cadence. Scraping faster than the source
+  # updates only adds load and produces flat segments that look like stalls.
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: halcyon-gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['gateway:8080']
+        labels:
+          service: gateway
+
+rule_files:
+  - /etc/prometheus/alerts.yml

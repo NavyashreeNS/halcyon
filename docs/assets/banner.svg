@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" width="1200" height="320" role="img" aria-label="Halcyon — the inference control plane">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0f16"/>
+      <stop offset="55%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#111a26"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#4c9aff"/>
+      <stop offset="100%" stop-color="#bc8cff"/>
+    </linearGradient>
+    <radialGradient id="glowA" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="#4c9aff" stop-opacity="0.30"/>
+      <stop offset="100%" stop-color="#4c9aff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowB" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="#bc8cff" stop-opacity="0.24"/>
+      <stop offset="100%" stop-color="#bc8cff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1200" height="320" fill="url(#bg)"/>
+  <ellipse cx="180" cy="40" rx="420" ry="240" fill="url(#glowA)"/>
+  <ellipse cx="1080" cy="300" rx="420" ry="240" fill="url(#glowB)"/>
+
+  <!-- Faint grid, evoking a metrics console -->
+  <g stroke="#1c2430" stroke-width="1" opacity="0.55">
+    <path d="M0 80 H1200 M0 160 H1200 M0 240 H1200"/>
+    <path d="M200 0 V320 M400 0 V320 M600 0 V320 M800 0 V320 M1000 0 V320"/>
+  </g>
+
+  <!-- Mark: many queued requests coalescing into one batch, dispatched to a device -->
+  <g transform="translate(78, 96)">
+    <rect x="0" y="0" width="128" height="128" rx="30" fill="#0d1117" stroke="#2a3644" stroke-width="2"/>
+    <circle cx="32" cy="34" r="8" fill="#4c9aff"/>
+    <circle cx="32" cy="64" r="8" fill="#4c9aff" opacity="0.72"/>
+    <circle cx="32" cy="94" r="8" fill="#4c9aff" opacity="0.44"/>
+    <path d="M46 34 Q76 34 82 64 Q76 94 46 94 M46 64 H82"
+          stroke="url(#accent)" stroke-width="5" stroke-linecap="round" fill="none"/>
+    <rect x="88" y="48" width="26" height="32" rx="8" fill="#3fb950"/>
+  </g>
+
+  <g transform="translate(246, 0)">
+    <text x="0" y="140" font-family="ui-sans-serif,-apple-system,Segoe UI,Inter,Roboto,sans-serif"
+          font-size="76" font-weight="700" letter-spacing="-2.5" fill="#e6edf3">Halcyon</text>
+    <text x="0" y="182" font-family="ui-sans-serif,-apple-system,Segoe UI,Inter,Roboto,sans-serif"
+          font-size="25" font-weight="500" fill="#8b98a9">The inference control plane for real-time ML fleets</text>
+
+    <!-- Capability chips -->
+    <g font-family="ui-monospace,SF Mono,JetBrains Mono,Menlo,monospace" font-size="15" font-weight="600">
+      <g transform="translate(0, 216)">
+        <rect width="222" height="34" rx="17" fill="rgba(76,154,255,0.12)" stroke="rgba(76,154,255,0.35)"/>
+        <text x="20" y="23" fill="#4c9aff">deadline-aware batching</text>
+      </g>
+      <g transform="translate(238, 216)">
+        <rect width="182" height="34" rx="17" fill="rgba(63,185,80,0.12)" stroke="rgba(63,185,80,0.35)"/>
+        <text x="20" y="23" fill="#3fb950">peak-EWMA routing</text>
+      </g>
+      <g transform="translate(436, 216)">
+        <rect width="196" height="34" rx="17" fill="rgba(210,153,34,0.12)" stroke="rgba(210,153,34,0.35)"/>
+        <text x="20" y="23" fill="#d29922">adaptive admission</text>
+      </g>
+      <g transform="translate(648, 216)">
+        <rect width="200" height="34" rx="17" fill="rgba(188,140,255,0.14)" stroke="rgba(188,140,255,0.38)"/>
+        <text x="20" y="23" fill="#bc8cff">SLO-gated rollout</text>
+      </g>
+    </g>
+  </g>
+
+  <!-- Headline result, right-aligned -->
+  <g transform="translate(1128, 96)" text-anchor="end">
+    <text y="0" font-family="ui-monospace,SF Mono,JetBrains Mono,Menlo,monospace"
+          font-size="13" letter-spacing="1.6" fill="#5b6675">GOODPUT UNDER OVERLOAD</text>
+    <text y="58" font-family="ui-monospace,SF Mono,JetBrains Mono,Menlo,monospace"
+          font-size="58" font-weight="700" fill="#3fb950">16×</text>
+    <text y="86" font-family="ui-sans-serif,-apple-system,Segoe UI,Inter,sans-serif"
+          font-size="15" fill="#8b98a9">vs. fixed-size batching</text>
+    <text y="112" font-family="ui-monospace,SF Mono,JetBrains Mono,Menlo,monospace"
+          font-size="13" fill="#5b6675">p50 2398ms → 885ms</text>
+  </g>
+
+  <rect y="316" width="1200" height="4" fill="url(#accent)"/>
+</svg>

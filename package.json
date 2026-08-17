@@ -1,0 +1,40 @@
+{
+  "name": "halcyon",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A real-time inference control plane: SLO-aware continuous batching, load-aware routing, and progressive model rollout for GPU fleets.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev --parallel",
+    "test": "turbo run test",
+    "test:watch": "turbo run test:watch --parallel",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "bench": "npm run bench --workspace @halcyon/core",
+    "format": "prettier --write \"**/*.{ts,tsx,js,json,md,yml,yaml}\"",
+    "format:check": "prettier --check \"**/*.{ts,tsx,js,json,md,yml,yaml}\"",
+    "db:generate": "npm run generate --workspace @halcyon/db",
+    "db:migrate": "npm run migrate --workspace @halcyon/db",
+    "stack:up": "docker compose -f infra/docker/docker-compose.yml up -d --build",
+    "stack:down": "docker compose -f infra/docker/docker-compose.yml down -v",
+    "stack:logs": "docker compose -f infra/docker/docker-compose.yml logs -f",
+    "loadtest": "node scripts/loadtest.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "prettier": "^3.4.2",
+    "tsx": "^4.19.2",
+    "turbo": "^2.3.3",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "packageManager": "npm@11.0.0"
+}

@@ -1,0 +1,64 @@
+# Alerting rules.
+#
+# Every rule here alerts on a *symptom users feel* rather than on a cause. "CPU is high" is
+# not an incident; "p99 latency has doubled" is. Cause-based alerts fire constantly during
+# healthy operation and train people to ignore the pager.
+
+groups:
+  - name: halcyon-slo
+    interval: 15s
+    rules:
+      - alert: HalcyonHighTailLatency
+        # Computed from cumulative buckets across all instances — the reason the gateway
+        # exports buckets rather than pre-computed quantiles, which cannot be aggregated.
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le, model) (rate(halcyon_request_duration_ms_bucket[5m]))
+          ) > 2000
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: 'p99 latency above 2s for {{ $labels.model }}'
+          description: 'Tail latency has exceeded the SLO for five minutes.'
+
+      - alert: HalcyonElevatedShedRate
+        expr: |
+          sum(rate(halcyon_requests_total{outcome=~"overloaded|queue_full|deadline_unreachable"}[5m]))
+            / sum(rate(halcyon_requests_total[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: 'More than 5% of requests are being shed'
+          description: >-
+            Shedding is correct behaviour under overload, but a sustained rate means the
+            fleet is undersized for offered load. Add replicas or lower admitted traffic.
+
+      - alert: HalcyonReplicaBreakerOpen
+        expr: halcyon_replicas{state="unhealthy"} > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: '{{ $value }} replica(s) removed from rotation by their circuit breaker'
+
+      - alert: HalcyonNoHealthyReplicas
+        expr: halcyon_replicas{state="active"} == 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: 'No replicas available to serve traffic'
+
+      - alert: HalcyonConcurrencyLimitCollapsed
+        # The adaptive limiter contracting hard is the earliest reliable signal of trouble:
+        # it moves before latency SLOs are breached, because it is what prevents the breach.
+        expr: halcyon_concurrency_limit < 16
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Adaptive concurrency limit has collapsed to {{ $value }}'
+          description: 'The limiter is detecting sustained queueing. Expect shedding to follow.'

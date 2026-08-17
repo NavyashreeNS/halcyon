@@ -1,0 +1,13 @@
+# Normalise line endings to LF in the repository, whatever the checkout platform.
+# Without this, a Windows checkout commits CRLF and every file shows as fully rewritten
+# the first time a Linux collaborator touches it.
+* text=auto eol=lf
+
+# Binary and generated assets must never be transformed.
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff2 binary
+
+# Lockfiles are generated; collapse them in diffs and exclude from language statistics.
+package-lock.json linguist-generated=true -diff

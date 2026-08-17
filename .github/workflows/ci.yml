@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A new push makes an in-flight run for the same ref obsolete. Cancelling it frees runners
+# and stops reviewers reading results for code that no longer exists.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Lint, typecheck and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+  benchmark:
+    name: Scheduler benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+
+      # The benchmark is fully seeded, so it produces identical numbers on every run. That
+      # makes it meaningful in CI: a change in the output is a change in scheduler behaviour,
+      # not machine noise, and it lands in the job summary where a reviewer will see it.
+      - name: Run batching benchmark
+        run: |
+          {
+            echo '## Scheduler benchmark'
+            echo
+            echo '```'
+            npm run bench --silent
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  integration:
+    name: End-to-end load test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+
+      - name: Build services
+        run: npm run build
+
+      - name: Boot the fleet
+        env:
+          # The production default observes each canary step for 30s, which is right in
+          # production and pointless in CI. The state machine is identical either way.
+          CANARY_ANALYSIS_INTERVAL_MS: '5000'
+        run: |
+          node scripts/dev-stack.mjs --canary > stack.log 2>&1 &
+          echo $! > stack.pid
+          # Poll for readiness instead of sleeping a fixed interval — a fixed sleep is either
+          # slower than necessary or flaky, and usually manages to be both.
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8080/readyz > /dev/null; then
+              echo "Fleet ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Fleet failed to become ready"
+          cat stack.log
+          exit 1
+
+      - name: Load test
+        run: node scripts/loadtest.mjs --clients 24 --seconds 20
+
+      - name: Verify a canary rollout completes
+        run: node scripts/verify-rollout.mjs
+
+      - name: Stack logs
+        if: always()
+        run: tail -n 100 stack.log
+
+      - name: Stop the fleet
+        if: always()
+        run: kill "$(cat stack.pid)" 2>/dev/null || true
+
+  docker:
+    name: Build images
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [gateway, worker, web]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.service }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/docker/Dockerfile.${{ matrix.service }}
+          push: false
+          tags: halcyon-${{ matrix.service }}:ci
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}

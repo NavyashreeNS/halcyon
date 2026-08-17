@@ -1,0 +1,70 @@
+# syntax=docker/dockerfile:1.7
+#
+# Multi-stage build for the gateway.
+#
+# The stages exist to keep the final image small and its layer cache useful. Manifests are
+# copied before sources so that `npm ci` — by far the slowest step — is only re-run when a
+# dependency actually changes, not on every source edit. The runtime stage then installs
+# production dependencies from scratch rather than copying the build stage's `node_modules`,
+# which would drag in the entire TypeScript toolchain.
+
+FROM node:22-alpine AS base
+WORKDIR /app
+ENV NODE_ENV=production
+
+# --- Dependencies --------------------------------------------------------------------------
+FROM base AS deps
+ENV NODE_ENV=development
+COPY package.json package-lock.json turbo.json tsconfig.base.json ./
+COPY packages/core/package.json ./packages/core/
+COPY packages/contracts/package.json ./packages/contracts/
+COPY packages/telemetry/package.json ./packages/telemetry/
+COPY packages/db/package.json ./packages/db/
+COPY apps/gateway/package.json ./apps/gateway/
+COPY apps/worker/package.json ./apps/worker/
+COPY apps/web/package.json ./apps/web/
+RUN npm ci --ignore-scripts
+
+# --- Build ---------------------------------------------------------------------------------
+FROM deps AS build
+COPY tsconfig.base.json turbo.json ./
+COPY packages ./packages
+COPY apps/gateway ./apps/gateway
+RUN npx turbo run build --filter=@halcyon/gateway
+
+# --- Production dependencies ---------------------------------------------------------------
+FROM base AS prod-deps
+COPY package.json package-lock.json ./
+COPY packages/core/package.json ./packages/core/
+COPY packages/contracts/package.json ./packages/contracts/
+COPY packages/telemetry/package.json ./packages/telemetry/
+COPY packages/db/package.json ./packages/db/
+COPY apps/gateway/package.json ./apps/gateway/
+RUN npm ci --omit=dev --ignore-scripts --workspace @halcyon/gateway --include-workspace-root
+
+# --- Runtime -------------------------------------------------------------------------------
+FROM base AS runtime
+
+# Run unprivileged. The node image ships a `node` user for exactly this; a container that
+# does not need root should never have it.
+RUN addgroup -S halcyon && adduser -S halcyon -G halcyon
+
+COPY --from=prod-deps --chown=halcyon:halcyon /app/node_modules ./node_modules
+COPY --from=build --chown=halcyon:halcyon /app/packages/core/dist ./packages/core/dist
+COPY --from=build --chown=halcyon:halcyon /app/packages/core/package.json ./packages/core/
+COPY --from=build --chown=halcyon:halcyon /app/packages/contracts/dist ./packages/contracts/dist
+COPY --from=build --chown=halcyon:halcyon /app/packages/contracts/package.json ./packages/contracts/
+COPY --from=build --chown=halcyon:halcyon /app/packages/telemetry/dist ./packages/telemetry/dist
+COPY --from=build --chown=halcyon:halcyon /app/packages/telemetry/package.json ./packages/telemetry/
+COPY --from=build --chown=halcyon:halcyon /app/apps/gateway/dist ./apps/gateway/dist
+COPY --from=build --chown=halcyon:halcyon /app/apps/gateway/package.json ./apps/gateway/
+
+USER halcyon
+EXPOSE 8080
+
+# Liveness is checked here too, so `docker compose` and any orchestrator that reads image
+# metadata agree on what "healthy" means rather than each inventing its own definition.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+CMD ["node", "apps/gateway/dist/server.js"]

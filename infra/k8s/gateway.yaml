@@ -1,0 +1,141 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: halcyon
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-config
+  namespace: halcyon
+data:
+  LOG_LEVEL: 'info'
+  MAX_BATCH_SIZE: '32'
+  MAX_BATCH_TOKENS: '16384'
+  MAX_QUEUE_DEPTH: '512'
+  LINGER_MS: '20'
+  SAFETY_MARGIN_MS: '15'
+  HEARTBEAT_TIMEOUT_MS: '15000'
+  CANARY_ANALYSIS_INTERVAL_MS: '30000'
+  TRACE_SAMPLE_RATIO: '0.1'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: halcyon
+  labels: { app: gateway }
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: gateway }
+  template:
+    metadata:
+      labels: { app: gateway }
+      annotations:
+        prometheus.io/scrape: 'true'
+        prometheus.io/port: '8080'
+        prometheus.io/path: '/metrics'
+    spec:
+      # Spread replicas across zones. Without this the scheduler is free to place all three
+      # on one node, and the "3 replicas" become a single point of failure with extra cost.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: gateway }
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: gateway
+          image: ghcr.io/navyashreens/halcyon-gateway:latest
+          ports:
+            - { name: http, containerPort: 8080 }
+          envFrom:
+            - configMapRef: { name: gateway-config }
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: halcyon-secrets, key: database-url }
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.observability:4318/v1/traces
+          resources:
+            # requests == limits for CPU is deliberate. The gateway's whole job is bounding
+            # latency, and CFS throttling at the limit produces exactly the multi-hundred-
+            # millisecond stalls it exists to prevent.
+            requests: { cpu: '1000m', memory: '512Mi' }
+            limits: { cpu: '1000m', memory: '1Gi' }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ['ALL'] }
+          # Liveness must NOT depend on replicas being registered, or a fleet-wide worker
+          # outage would cause Kubernetes to restart every healthy gateway on top of it.
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          lifecycle:
+            preStop:
+              # Give the load balancer time to observe the endpoint removal before the
+              # process starts refusing connections. Without this pause, requests in flight
+              # towards this pod arrive after it has stopped listening.
+              exec: { command: ['sleep', '10'] }
+      terminationGracePeriodSeconds: 45
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: halcyon
+spec:
+  selector: { app: gateway }
+  ports:
+    - { name: http, port: 80, targetPort: http }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: gateway
+  namespace: halcyon
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: gateway }
+  minReplicas: 3
+  maxReplicas: 30
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 65 } }
+    # Queue depth leads CPU as an overload signal: requests pile up before the process is
+    # saturated, so scaling on it adds capacity before latency is affected rather than after.
+    - type: Pods
+      pods:
+        metric: { name: halcyon_queue_depth }
+        target: { type: AverageValue, averageValue: '40' }
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies: [{ type: Percent, value: 100, periodSeconds: 30 }]
+    scaleDown:
+      # Scale down slowly. Inference traffic is bursty, and removing capacity moments before
+      # the next burst is more expensive than briefly running a pod too many.
+      stabilizationWindowSeconds: 300
+      policies: [{ type: Percent, value: 25, periodSeconds: 60 }]
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gateway
+  namespace: halcyon
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels: { app: gateway }
